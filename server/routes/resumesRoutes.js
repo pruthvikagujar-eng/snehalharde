@@ -6,7 +6,9 @@ const resumesDb = require("../db/resumesDb");
 const jobsDb = require("../db/jobsDb");
 const awsService = require("../services/awsService");
 const { analyzeResumeAgainstJd } = require("../services/resumeAnalysisService");
-const { extractRawText, parseResumeText, classifyField } = require("../services/resumeParserService");
+const { parseResume } = require("../services/resumeParserService");
+const { ALL_DOMAINS } = require("../services/domainClassifier");
+const emailService = require("../services/emailService");
 
 const ALLOWED_RESUME_EXTENSIONS = [".pdf", ".docx", ".doc", ".txt", ".rtf"];
 const ALLOWED_RESUME_MIMES = [
@@ -20,7 +22,7 @@ const ALLOWED_RESUME_MIMES = [
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 },
+  limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const ext = path.extname(file.originalname || "").toLowerCase();
     const mime = (file.mimetype || "").toLowerCase();
@@ -30,7 +32,7 @@ const upload = multer({
 
     if (!hasValidExt && !hasValidMime) {
       return cb(
-        new Error(`Invalid document type "${ext || file.originalname}". In resumes, only resume documents (.pdf, .docx, .doc, .txt) are accepted. Other document types are not allowed.`)
+        new Error(`Invalid document type "${ext || file.originalname}". Only resume documents (.pdf, .docx, .doc, .txt) are accepted.`)
       );
     }
     cb(null, true);
@@ -50,18 +52,78 @@ const handleUpload = (req, res, next) => {
   });
 };
 
+const handleMultipleUpload = (req, res, next) => {
+  upload.array("resumes", 20)(req, res, (err) => {
+    if (err) {
+      return res.status(400).json({
+        success: false,
+        error: err.message || "Only resume documents (.pdf, .docx, .doc, .txt) are accepted."
+      });
+    }
+    next();
+  });
+};
+
+// Helper to resolve target job from request
+function resolveJob(jobId, customJdBody) {
+  let job = null;
+  if (jobId && jobId !== "custom" && jobId !== "all") {
+    job = jobsDb.getById(jobId);
+  }
+  if (!job && customJdBody) {
+    try {
+      const cJd = typeof customJdBody === "string" ? JSON.parse(customJdBody) : customJdBody;
+      job = {
+        id: "custom-jd",
+        title: cJd.title || "Target Role",
+        dept: cJd.dept || "Engineering",
+        expLevel: cJd.expLevel || "2-5 Years",
+        keySkills: Array.isArray(cJd.keySkills)
+          ? cJd.keySkills
+          : (cJd.keySkills ? cJd.keySkills.split(",").map(s => s.trim()).filter(Boolean) : []),
+        description: cJd.description || "",
+        workMode: cJd.workMode || "Full-time"
+      };
+    } catch (e) {
+      console.warn("Could not parse customJd JSON:", e.message);
+    }
+  }
+  if (!job) {
+    const allJobs = jobsDb.getAll({ status: "Active" });
+    job = allJobs[0] || {
+      id: "default-job",
+      title: "Senior Full Stack Engineer",
+      dept: "Engineering",
+      expLevel: "3+ Years",
+      keySkills: ["Python", "React", "SQL", "Docker"],
+      description: "Software engineering role requiring web development, databases, and containerization."
+    };
+  }
+  return job;
+}
+
 // GET /api/resumes - list all candidates/resumes
 router.get("/", (req, res) => {
   try {
-    const { status, role, search, field, domain, jobId } = req.query;
-    const list = resumesDb.getAll({ status, role, search, field, domain, jobId });
-    res.json({ success: true, count: list.length, data: list });
+    const { status, role, search, field, domain, jobId, sortBy } = req.query;
+    const list = resumesDb.getAll({ status, role, search, field, domain, jobId, sortBy });
+    res.json({
+      success: true,
+      count: list.length,
+      data: list,
+      domains: ALL_DOMAINS
+    });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// POST /api/resumes/upload-and-screen - upload resume file and screen against target JD
+// GET /api/resumes/domains - list available domains
+router.get("/domains", (req, res) => {
+  res.json({ success: true, domains: ALL_DOMAINS });
+});
+
+// POST /api/resumes/upload-and-screen - upload single resume file and screen against target JD
 router.post("/upload-and-screen", handleUpload, async (req, res) => {
   try {
     if (!req.file) {
@@ -71,91 +133,110 @@ router.post("/upload-and-screen", handleUpload, async (req, res) => {
     const originalName = req.file.originalname || "resume.pdf";
     const mimeType = req.file.mimetype || "application/pdf";
 
-    // Extract real text from file
-    const rawText = await extractRawText(req.file.buffer, mimeType, originalName);
+    // 1. Production parsing pipeline
+    const parsed = await parseResume(req.file.buffer, mimeType, originalName);
 
-    // Parse candidate details accurately from text
-    const parsedCandidate = await parseResumeText(rawText, originalName);
+    // 2. Resolve target job
+    const job = resolveJob(req.body.jobId, req.body.customJd);
 
-    // Resolve target job
-    let job = null;
-    if (req.body.jobId && req.body.jobId !== "custom") {
-      job = jobsDb.getById(req.body.jobId);
-    }
-    if (!job && req.body.customJd) {
-      try {
-        const cJd = typeof req.body.customJd === "string" ? JSON.parse(req.body.customJd) : req.body.customJd;
-        job = {
-          id: "custom-jd",
-          title: cJd.title || "Target Role",
-          dept: cJd.dept || "Engineering",
-          expLevel: cJd.expLevel || "2-5 Years",
-          keySkills: Array.isArray(cJd.keySkills)
-            ? cJd.keySkills
-            : (cJd.keySkills ? cJd.keySkills.split(",").map(s => s.trim()).filter(Boolean) : []),
-          description: cJd.description || "",
-          workMode: cJd.workMode || "Full-time"
-        };
-      } catch (e) {
-        console.warn("Could not parse customJd JSON:", e.message);
-      }
-    }
-    if (!job) {
-      const allJobs = jobsDb.getAll({ status: "Active" });
-      job = allJobs[0] || {
-        id: "default-job",
-        title: "Software Engineer",
-        dept: "Engineering",
-        expLevel: "2-4 Years",
-        keySkills: ["Python", "Flask", "SQL"],
-        description: "Software developer role"
-      };
-    }
+    // 3. Transparent, reproducible ATS scoring
+    const candidateDataForAnalysis = {
+      name: parsed.candidate.name,
+      role: parsed.experience[0]?.title || "Professional",
+      experience: parsed.experience_display,
+      experience_years: parsed.experience_years,
+      education: parsed.education,
+      certifications: parsed.certifications,
+      all_normalized_skills: parsed.all_normalized_skills,
+      allSkills: parsed.all_normalized_skills.map(s => s.normalized),
+      skills: parsed.skills.technical,
+      rawText: parsed.raw_text,
+      summary: parsed.professional_summary,
+      domain: parsed.domains.primary,
+      secondary_domains: parsed.domains.secondary,
+      resume_quality: parsed.resume_quality
+    };
 
-    // Strictly analyze against JD
-    const analysis = await analyzeResumeAgainstJd(parsedCandidate, job);
+    const analysis = await analyzeResumeAgainstJd(candidateDataForAnalysis, job);
 
-    const candidateField = parsedCandidate.field || parsedCandidate.domain || classifyField(rawText, parsedCandidate.allSkills || parsedCandidate.skills || [], parsedCandidate.role, originalName);
-
-    // Store resume in AWS S3 storage
+    // 4. Optional S3 backup
     let s3Metadata = null;
     try {
       const sanitizedName = originalName.replace(/[^a-zA-Z0-9.-]/g, "_");
       const s3Key = `resumes/${Date.now()}_${sanitizedName}`;
       s3Metadata = await awsService.uploadToS3(req.file.buffer, s3Key, mimeType);
     } catch (s3Err) {
-      console.warn("[AWS-S3] Upload error:", s3Err.message);
+      console.warn("[AWS-S3] Upload notice:", s3Err.message);
     }
 
-    // Persist new candidate in database with accurate screening outcome
-    const newCandidate = resumesDb.create({
-      name: parsedCandidate.name,
-      email: parsedCandidate.email,
-      phone: parsedCandidate.phone,
-      location: parsedCandidate.location || "India",
-      role: parsedCandidate.role,
-      field: candidateField,
-      domain: candidateField,
-      experience: parsedCandidate.experience,
-      expYears: parsedCandidate.expYears,
-      skills: parsedCandidate.skills,
-      allSkills: parsedCandidate.allSkills,
-      education: parsedCandidate.education,
+    // 5. Persist candidate in database with no duplicate creation
+    const candidateRecord = resumesDb.create({
+      name: parsed.candidate.name,
+      email: parsed.candidate.email,
+      phone: parsed.candidate.phone,
+      location: parsed.candidate.location,
+      role: parsed.experience[0]?.title || "Professional",
+      field: parsed.domains.primary,
+      domain: parsed.domains.primary,
+      secondaryDomains: parsed.domains.secondary,
+      experience: parsed.experience_display,
+      expYears: parsed.experience_years,
+      skills: (parsed.all_normalized_skills || []).slice(0, 3).map(s => s.normalized),
+      allSkills: (parsed.all_normalized_skills || []).map(s => s.normalized),
+      all_normalized_skills: parsed.all_normalized_skills,
+      categorizedSkills: parsed.skills,
+      education: parsed.education[0]?.degree || "Bachelor's Degree",
+      educationEntries: parsed.education,
+      experienceEntries: parsed.experience,
+      projects: parsed.projects,
+      certifications: parsed.certifications,
       atsScore: analysis.atsScore,
       matchScore: analysis.matchScore,
       skillsMatchPct: analysis.skillsMatchPct,
       status: analysis.status,
+      breakdown: analysis.breakdown,
       matchedSkills: analysis.matchedSkills,
       missingSkills: analysis.missingSkills,
+      missingRequiredSkills: analysis.missingRequiredSkills,
+      missingPreferredSkills: analysis.missingPreferredSkills,
       keyPoints: analysis.keyPoints,
-      summary: analysis.aiSummary,
+      summary: analysis.aiSummary || parsed.professional_summary,
+      resumeQuality: parsed.resume_quality,
+      resumeData: {
+        fileName: originalName,
+        rawText: parsed.raw_text,
+        education: parsed.education,
+        educationEntries: parsed.education,
+        experienceEntries: parsed.experience,
+        projects: parsed.projects,
+        certifications: parsed.certifications,
+        resumeQuality: parsed.resume_quality,
+        requiresOcr: parsed.requires_ocr,
+        ocrWarning: parsed.ocr_warning,
+        s3Url: s3Metadata?.url || null,
+        storageProvider: s3Metadata?.url ? "AWS S3" : "Local"
+      },
+      aiAnalysis: {
+        summary: analysis.aiSummary || parsed.professional_summary,
+        keyPoints: analysis.keyPoints,
+        breakdown: analysis.breakdown,
+        matchedSkills: analysis.matchedSkills,
+        missingSkills: analysis.missingSkills,
+        missingRequiredSkills: analysis.missingRequiredSkills,
+        missingPreferredSkills: analysis.missingPreferredSkills,
+        atsScore: analysis.atsScore,
+        matchScore: analysis.matchScore,
+        skillsMatchPct: analysis.skillsMatchPct,
+        status: analysis.status
+      },
       targetJobId: job.id,
       targetJobTitle: job.title,
       jobId: job.id && job.id !== "custom-jd" ? job.id : null,
       resumeFileName: originalName,
-      uploadedDate: new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }),
-      rawText: rawText.slice(0, 2000),
-      storageProvider: "AWS S3",
+      requiresOcr: parsed.requires_ocr,
+      ocrWarning: parsed.ocr_warning,
+      rawText: parsed.raw_text?.slice(0, 3000),
+      storageProvider: s3Metadata?.url ? "AWS S3" : "Local",
       s3Url: s3Metadata?.url || null,
       s3Key: s3Metadata?.key || null,
       s3Bucket: s3Metadata?.bucket || null
@@ -163,10 +244,11 @@ router.post("/upload-and-screen", handleUpload, async (req, res) => {
 
     res.status(201).json({
       success: true,
-      data: newCandidate,
+      data: candidateRecord,
       targetJob: job,
       analysis,
-      message: `Resume analyzed: ATS ${analysis.atsScore}/100 (${analysis.status})`
+      parsed,
+      message: `Resume parsed and classified into "${parsed.domains.primary}": ATS ${analysis.atsScore}/100 (${analysis.status})`
     });
   } catch (err) {
     console.error("Upload and screen error:", err);
@@ -174,39 +256,136 @@ router.post("/upload-and-screen", handleUpload, async (req, res) => {
   }
 });
 
-// POST /api/resumes/analyze-batch-jd - batch analyze multiple resumes against a target JD
+// POST /api/resumes/upload-batch - upload and process multiple resumes simultaneously
+router.post("/upload-batch", handleMultipleUpload, async (req, res) => {
+  try {
+    const files = req.files;
+    if (!files || files.length === 0) {
+      return res.status(400).json({ success: false, error: "No resume files uploaded" });
+    }
+
+    const job = resolveJob(req.body.jobId, req.body.customJd);
+    const results = [];
+    const errors = [];
+
+    for (const file of files) {
+      const originalName = file.originalname || "resume.pdf";
+      const mimeType = file.mimetype || "application/pdf";
+
+      try {
+        const parsed = await parseResume(file.buffer, mimeType, originalName);
+
+        const candidateDataForAnalysis = {
+          name: parsed.candidate.name,
+          role: parsed.experience[0]?.title || "Professional",
+          experience: parsed.experience_display,
+          experience_years: parsed.experience_years,
+          education: parsed.education,
+          certifications: parsed.certifications,
+          all_normalized_skills: parsed.all_normalized_skills,
+          allSkills: parsed.all_normalized_skills.map(s => s.normalized),
+          skills: parsed.skills.technical,
+          rawText: parsed.raw_text,
+          summary: parsed.professional_summary,
+          domain: parsed.domains.primary,
+          secondary_domains: parsed.domains.secondary,
+          resume_quality: parsed.resume_quality
+        };
+
+        const analysis = await analyzeResumeAgainstJd(candidateDataForAnalysis, job);
+
+        const candidateRecord = resumesDb.create({
+          name: parsed.candidate.name,
+          email: parsed.candidate.email,
+          phone: parsed.candidate.phone,
+          location: parsed.candidate.location,
+          role: parsed.experience[0]?.title || "Professional",
+          field: parsed.domains.primary,
+          domain: parsed.domains.primary,
+          secondaryDomains: parsed.domains.secondary,
+          experience: parsed.experience_display,
+          expYears: parsed.experience_years,
+          skills: (parsed.all_normalized_skills || []).slice(0, 3).map(s => s.normalized),
+          allSkills: (parsed.all_normalized_skills || []).map(s => s.normalized),
+          all_normalized_skills: parsed.all_normalized_skills,
+          categorizedSkills: parsed.skills,
+          education: parsed.education[0]?.degree || "Bachelor's Degree",
+          educationEntries: parsed.education,
+          experienceEntries: parsed.experience,
+          projects: parsed.projects,
+          certifications: parsed.certifications,
+          atsScore: analysis.atsScore,
+          matchScore: analysis.matchScore,
+          skillsMatchPct: analysis.skillsMatchPct,
+          status: analysis.status,
+          breakdown: analysis.breakdown,
+          matchedSkills: analysis.matchedSkills,
+          missingSkills: analysis.missingSkills,
+          missingRequiredSkills: analysis.missingRequiredSkills,
+          missingPreferredSkills: analysis.missingPreferredSkills,
+          keyPoints: analysis.keyPoints,
+          summary: analysis.aiSummary || parsed.professional_summary,
+          resumeQuality: parsed.resume_quality,
+          resumeData: {
+            fileName: originalName,
+            rawText: parsed.raw_text,
+            education: parsed.education,
+            educationEntries: parsed.education,
+            experienceEntries: parsed.experience,
+            projects: parsed.projects,
+            certifications: parsed.certifications,
+            resumeQuality: parsed.resume_quality,
+            requiresOcr: parsed.requires_ocr,
+            ocrWarning: parsed.ocr_warning,
+            storageProvider: "Local"
+          },
+          aiAnalysis: {
+            summary: analysis.aiSummary || parsed.professional_summary,
+            keyPoints: analysis.keyPoints,
+            breakdown: analysis.breakdown,
+            matchedSkills: analysis.matchedSkills,
+            missingSkills: analysis.missingSkills,
+            missingRequiredSkills: analysis.missingRequiredSkills,
+            missingPreferredSkills: analysis.missingPreferredSkills,
+            atsScore: analysis.atsScore,
+            matchScore: analysis.matchScore,
+            skillsMatchPct: analysis.skillsMatchPct,
+            status: analysis.status
+          },
+          targetJobId: job.id,
+          targetJobTitle: job.title,
+          jobId: job.id && job.id !== "custom-jd" ? job.id : null,
+          resumeFileName: originalName,
+          requiresOcr: parsed.requires_ocr,
+          ocrWarning: parsed.ocr_warning,
+          rawText: parsed.raw_text?.slice(0, 3000)
+        });
+
+        results.push(candidateRecord);
+      } catch (fileErr) {
+        console.error(`Error parsing file ${originalName}:`, fileErr);
+        errors.push({ filename: originalName, error: fileErr.message });
+      }
+    }
+
+    res.status(201).json({
+      success: true,
+      data: results,
+      errors,
+      targetJob: job,
+      message: `Batch processed: ${results.length} resumes uploaded and classified (${errors.length} errors)`
+    });
+  } catch (err) {
+    console.error("Batch upload error:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/resumes/analyze-batch-jd - batch re-analyze multiple resumes against a target JD
 router.post("/analyze-batch-jd", async (req, res) => {
   try {
     const { jobId, customJd, candidateIds } = req.body;
-    let job = null;
-    if (jobId) {
-      job = jobsDb.getById(jobId);
-    }
-    if (!job && customJd) {
-      job = {
-        id: "custom-jd",
-        title: customJd.title || "Target Role",
-        dept: customJd.dept || "Engineering",
-        expLevel: customJd.expLevel || "2-5 Years",
-        keySkills: Array.isArray(customJd.keySkills)
-          ? customJd.keySkills
-          : (customJd.keySkills ? customJd.keySkills.split(",").map(s => s.trim()).filter(Boolean) : []),
-        description: customJd.description || "",
-        workMode: customJd.workMode || "Full-time"
-      };
-    }
-    if (!job) {
-      // Default to first active job
-      const allJobs = jobsDb.getAll({ status: "Active" });
-      job = allJobs[0] || {
-        id: "default-job",
-        title: "Software Engineer",
-        dept: "Engineering",
-        expLevel: "2-4 Years",
-        keySkills: ["Python", "Flask", "SQL", "React", "Docker"],
-        description: "General software engineer position"
-      };
-    }
+    const job = resolveJob(jobId, customJd);
 
     const allCandidates = resumesDb.getAll();
     const targets = candidateIds && candidateIds.length > 0
@@ -222,8 +401,11 @@ router.post("/analyze-batch-jd", async (req, res) => {
             matchScore: analysis.matchScore,
             skillsMatchPct: analysis.skillsMatchPct,
             status: analysis.status,
+            breakdown: analysis.breakdown,
             matchedSkills: analysis.matchedSkills,
             missingSkills: analysis.missingSkills,
+            missingRequiredSkills: analysis.missingRequiredSkills,
+            missingPreferredSkills: analysis.missingPreferredSkills,
             keyPoints: analysis.keyPoints,
             summary: analysis.aiSummary,
             targetJobId: job.id,
@@ -268,28 +450,7 @@ router.post("/:id/analyze-jd", async (req, res) => {
     }
 
     const { jobId, customJd } = req.body;
-    let job = null;
-    if (jobId) {
-      job = jobsDb.getById(jobId);
-    }
-    if (!job && customJd) {
-      job = {
-        id: "custom-jd",
-        title: customJd.title || candidate.role || "Target Role",
-        dept: customJd.dept || "Engineering",
-        expLevel: customJd.expLevel || "2-5 Years",
-        keySkills: Array.isArray(customJd.keySkills)
-          ? customJd.keySkills
-          : (customJd.keySkills ? customJd.keySkills.split(",").map(s => s.trim()).filter(Boolean) : candidate.allSkills || []),
-        description: customJd.description || "",
-        workMode: customJd.workMode || "Full-time"
-      };
-    }
-    if (!job) {
-      // Find matching job by role or first job
-      const allJobs = jobsDb.getAll();
-      job = allJobs.find(j => j.title.toLowerCase().includes(candidate.role.toLowerCase())) || allJobs[0];
-    }
+    const job = resolveJob(jobId, customJd);
 
     const analysis = await analyzeResumeAgainstJd(candidate, job);
     const updated = resumesDb.update(candidate.id, {
@@ -297,8 +458,11 @@ router.post("/:id/analyze-jd", async (req, res) => {
       matchScore: analysis.matchScore,
       skillsMatchPct: analysis.skillsMatchPct,
       status: analysis.status,
+      breakdown: analysis.breakdown,
       matchedSkills: analysis.matchedSkills,
       missingSkills: analysis.missingSkills,
+      missingRequiredSkills: analysis.missingRequiredSkills,
+      missingPreferredSkills: analysis.missingPreferredSkills,
       keyPoints: analysis.keyPoints,
       summary: analysis.aiSummary,
       targetJobId: job.id,
@@ -331,7 +495,7 @@ router.get("/:id", (req, res) => {
   }
 });
 
-// POST /api/resumes - create/upload resume
+// POST /api/resumes - create/upload resume directly
 router.post("/", (req, res) => {
   try {
     const candidate = resumesDb.create(req.body);
@@ -342,12 +506,52 @@ router.post("/", (req, res) => {
 });
 
 // PUT /api/resumes/:id - update resume
-router.put("/:id", (req, res) => {
+router.put("/:id", async (req, res) => {
   try {
+    const existing = resumesDb.getById(req.params.id);
     const updated = resumesDb.update(req.params.id, req.body);
     if (!updated) {
       return res.status(404).json({ success: false, error: "Candidate resume not found" });
     }
+
+    const candEmail = (updated.email || existing?.email || "").trim();
+    const candName = updated.name || existing?.name || "Candidate";
+    const candRole = updated.role || existing?.role || "Software Engineer";
+    const authorEmail = updated.userEmail || updated.createdBy || req.headers["x-user-email"] || "";
+
+    if (candEmail && candEmail.includes("@") && req.body.status) {
+      const newStatus = req.body.status.trim().toLowerCase();
+      const prevStatus = (existing?.status || "").trim().toLowerCase();
+
+      if ((newStatus === "selected" || newStatus === "shortlisted" || newStatus === "hired") && prevStatus !== newStatus) {
+        try {
+          await emailService.sendCandidateSelectedEmail({
+            toEmail: candEmail,
+            candidateName: candName,
+            role: candRole,
+            company: "AvaHire Technologies",
+            userEmail: authorEmail,
+          });
+          console.log(`[RESUMES-EMAIL] Selection email sent to ${candEmail}`);
+        } catch (emErr) {
+          console.warn("[RESUMES-EMAIL] Selection email notice:", emErr.message);
+        }
+      } else if (newStatus === "rejected" && prevStatus !== "rejected") {
+        try {
+          await emailService.sendCandidateRejectedEmail({
+            toEmail: candEmail,
+            candidateName: candName,
+            role: candRole,
+            company: "AvaHire Technologies",
+            userEmail: authorEmail,
+          });
+          console.log(`[RESUMES-EMAIL] Rejection email sent to ${candEmail}`);
+        } catch (emErr) {
+          console.warn("[RESUMES-EMAIL] Rejection email notice:", emErr.message);
+        }
+      }
+    }
+
     res.json({ success: true, data: updated, message: "Candidate updated successfully" });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -355,16 +559,56 @@ router.put("/:id", (req, res) => {
 });
 
 // PATCH /api/resumes/:id/status - update status (e.g. Shortlisted, Rejected, Hired)
-router.patch("/:id/status", (req, res) => {
+router.patch("/:id/status", async (req, res) => {
   try {
     const { status } = req.body;
     if (!status) {
       return res.status(400).json({ success: false, error: "Status is required" });
     }
+    const existing = resumesDb.getById(req.params.id);
     const updated = resumesDb.updateStatus(req.params.id, status);
     if (!updated) {
       return res.status(404).json({ success: false, error: "Candidate resume not found" });
     }
+
+    const candEmail = (updated.email || existing?.email || "").trim();
+    const candName = updated.name || existing?.name || "Candidate";
+    const candRole = updated.role || existing?.role || "Software Engineer";
+    const authorEmail = updated.userEmail || updated.createdBy || req.headers["x-user-email"] || "";
+
+    if (candEmail && candEmail.includes("@")) {
+      const newStatus = status.trim().toLowerCase();
+      const prevStatus = (existing?.status || "").trim().toLowerCase();
+
+      if ((newStatus === "selected" || newStatus === "shortlisted" || newStatus === "hired") && prevStatus !== newStatus) {
+        try {
+          await emailService.sendCandidateSelectedEmail({
+            toEmail: candEmail,
+            candidateName: candName,
+            role: candRole,
+            company: "AvaHire Technologies",
+            userEmail: authorEmail,
+          });
+          console.log(`[RESUMES-EMAIL] Selection email sent to ${candEmail}`);
+        } catch (emErr) {
+          console.warn("[RESUMES-EMAIL] Selection email notice:", emErr.message);
+        }
+      } else if (newStatus === "rejected" && prevStatus !== "rejected") {
+        try {
+          await emailService.sendCandidateRejectedEmail({
+            toEmail: candEmail,
+            candidateName: candName,
+            role: candRole,
+            company: "AvaHire Technologies",
+            userEmail: authorEmail,
+          });
+          console.log(`[RESUMES-EMAIL] Rejection email sent to ${candEmail}`);
+        } catch (emErr) {
+          console.warn("[RESUMES-EMAIL] Rejection email notice:", emErr.message);
+        }
+      }
+    }
+
     res.json({ success: true, data: updated, message: `Status updated to ${status}` });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
